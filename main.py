@@ -43,6 +43,8 @@ async def on_message(message):
 @bot.command()
 async def hello(ctx):
     await ctx.send(f"Hello {ctx.author.mention}!")
+
+@bot.command()
 async def Kennedy(ctx):
     await ctx.send(f"Hello Kennedy! how are you doing, hope you having a great day!")
 
