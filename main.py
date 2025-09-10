@@ -1,66 +1,72 @@
-import discord
-from discord.ext import commands
-import logging
-from dotenv import load_dotenv
 import os
-from flask import Flask, jsonify, request
-import webserver
-import yfinance as yf
-import requests
-from discord.ext import tasks
+import logging
 import random
-from datetime import datetime
-from datetime import datetime, date
-from mangum import Mangum
-from asgiref.wsgi import WsgiToAsgi
+import requests
+import discord
+import yfinance as yf
+from dotenv import load_dotenv
+from discord.ext import commands, tasks
+from datetime import datetime, date, timezone
+import webserver
+import json
 
-
+# --- ENVIRONMENT ---
+load_dotenv()
+token = os.getenv("DISCORD_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-load_dotenv()
-token = os.getenv('DISCORD_TOKEN')
+# --- LOGGING ---
+handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+# --- DISCORD INTENTS ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = commands.Bot(command_prefix='!', intents=intents)
-
+# --- CONSTANTS ---
 s_role = "shut-in"
-WATCHLIST = ["AAPL", "TSLA", "MSFT", "PLTR", "UAL" ]   # you can expand this
-ALERT_CHANNEL_ID = 1414833850777075722 # replace with your Discord channel ID
-ALERT_THRESHOLD = 2.0  # % move
+WATCHLIST_FILE = "watchlist.json"
+ALERT_CHANNEL_ID = 1414833850777075722
 SUMMARY_CHANNEL_ID = 1414833850777075722
+ALERT_THRESHOLD = 2.0  # % move
 
+# --- WATCHLIST STORAGE ---
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        with open(WATCHLIST_FILE, "r") as f:
+            return json.load(f)
+    return ["AAPL", "TSLA", "MSFT"]  # default list
+
+def save_watchlist():
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(WATCHLIST, f)
+
+WATCHLIST = load_watchlist()
+
+# --- UTILITIES ---
 def to_date(ed):
     """Convert various yfinance earnings date formats to datetime.date"""
     if isinstance(ed, list):
-        ed = ed[0]  # yfinance sometimes returns a list
+        ed = ed[0]
     if isinstance(ed, datetime):
         return ed.date()
-    if isinstance(ed, date):  # already a date
+    if isinstance(ed, date):
         return ed
-    if hasattr(ed, "to_pydatetime"):  # pandas Timestamp
+    if hasattr(ed, "to_pydatetime"):
         return ed.to_pydatetime().date()
     return None
-
 
 def get_stock_info(symbol):
     try:
         stock = yf.Ticker(symbol)
-        # Get last 5 days to ensure data is there
         data = stock.history(period="5d", interval="1d")
 
         if data.empty:
             return None, None, None
 
-        # Latest price
-        price = data['Close'].iloc[-1]
-
-        # Previous close
-        prev_close = data['Close'].iloc[-2] if len(data) > 1 else price
-
+        price = data["Close"].iloc[-1]
+        prev_close = data["Close"].iloc[-2] if len(data) > 1 else price
         change = price - prev_close
         pct_change = (change / prev_close) * 100 if prev_close else 0
 
@@ -73,7 +79,7 @@ def get_stock_news(symbol):
     try:
         url = f"https://newsapi.org/v2/everything?q={symbol}&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
         res = requests.get(url).json()
-        articles = res.get("articles", [])[:3]  # top 3 recent news
+        articles = res.get("articles", [])[:3]
         if not articles:
             return ["No major recent news found."]
         return [f"• {a['title']} ({a['source']['name']})" for a in articles]
@@ -81,31 +87,40 @@ def get_stock_news(symbol):
         print(f"Error fetching news: {e}")
         return ["Error fetching news."]
 
-
+# --- TASKS ---
 @tasks.loop(minutes=5)
 async def stock_alerts():
     channel = bot.get_channel(ALERT_CHANNEL_ID)
     if not channel:
-        print("❌ ALERT CHANNEL NOT FOUND. Check ALERT_CHANNEL_ID.")
+        print("❌ ALERT CHANNEL NOT FOUND.")
         return
 
-    msg = "**📈 Stock Updates**\n"
+    embed = discord.Embed(
+        title="📈 Stock Updates",
+        color=0xf1c40f,
+        timestamp=datetime.now(timezone.utc)
+    )
+
     for symbol in WATCHLIST:
         price, change, pct = get_stock_info(symbol)
-        msg += f"{symbol}: ${price:.2f} ({pct:+.2f}%)\n"
+        if not price:
+            continue
 
-        # ⚡ Alert only if threshold is crossed
-        if price and abs(pct) >= ALERT_THRESHOLD:
-            direction = "🔺 UP" if change > 0 else "🔻 DOWN"
-            msg += f"⚡ **ALERT**: {symbol} is {direction} {pct:.2f}%\n"
+        direction = "🔺" if change > 0 else "🔻"
+        value = f"${price:.2f} ({pct:+.2f}%)"
 
-    await channel.send(msg)
+        if abs(pct) >= ALERT_THRESHOLD:
+            value += f" ⚡ ALERT: {direction} {pct:.2f}%"
 
+        embed.add_field(name=symbol, value=value, inline=False)
+
+    await channel.send(embed=embed)
 
 @tasks.loop(hours=24)
 async def daily_summary():
     channel = bot.get_channel(SUMMARY_CHANNEL_ID)
     gainers, losers = [], []
+
     for symbol in WATCHLIST:
         price, change, pct = get_stock_info(symbol)
         if price:
@@ -117,12 +132,27 @@ async def daily_summary():
     gainers = sorted(gainers, key=lambda x: x[1], reverse=True)[:3]
     losers = sorted(losers, key=lambda x: x[1])[:3]
 
-    msg = "**📊 Daily Market Summary**\n\n"
+    embed = discord.Embed(
+        title="📊 Daily Market Summary",
+        color=0x1abc9c,
+        timestamp=datetime.now(timezone.utc)
+    )
+
     if gainers:
-        msg += "**Top Gainers:**\n" + "\n".join([f"{s}: +{p:.2f}%" for s, p in gainers]) + "\n\n"
+        embed.add_field(
+            name="📈 Top Gainers",
+            value="\n".join([f"**{s}**: +{p:.2f}%" for s, p in gainers]),
+            inline=False
+        )
     if losers:
-        msg += "**Top Losers:**\n" + "\n".join([f"{s}: {p:.2f}%" for s, p in losers])
-    await channel.send(msg)
+        embed.add_field(
+            name="📉 Top Losers",
+            value="\n".join([f"**{s}**: {p:.2f}%" for s, p in losers]),
+            inline=False
+        )
+
+    embed.set_footer(text="Market data via Yahoo Finance")
+    await channel.send(embed=embed)
 
 @tasks.loop(hours=24)
 async def earnings_reminder():
@@ -131,10 +161,6 @@ async def earnings_reminder():
         try:
             stock = yf.Ticker(symbol)
             cal = stock.calendar
-
-            if not cal:
-                continue
-
             earnings_date = None
 
             if isinstance(cal, dict):
@@ -147,56 +173,92 @@ async def earnings_reminder():
                 today = datetime.now().date()
                 if (earnings_date - today).days == 1:
                     await channel.send(f"📢 Reminder: **{symbol}** reports earnings tomorrow!")
-
-        except Exception as e:
-            print(f"Earnings check failed for {symbol}: {e}")
         except Exception as e:
             print(f"Earnings check failed for {symbol}: {e}")
 
+# --- COMMANDS ---
 @bot.command()
 async def stock(ctx, symbol: str):
-    """Get live stock price and % change."""
     price, change, pct = get_stock_info(symbol.upper())
     if price is None:
         await ctx.send(f"Could not fetch data for {symbol.upper()}.")
         return
 
     direction = "🔺 UP" if change > 0 else "🔻 DOWN"
-    await ctx.send(f"**{symbol.upper()}** is {direction}\n"
-                   f"Price: ${price:.2f}\nChange: {change:.2f} ({pct:.2f}%)")
+    color = 0x00ff00 if change > 0 else 0xff0000
 
+    embed = discord.Embed(
+        title=f"{symbol.upper()} Stock Update",
+        description=f"{direction} {pct:.2f}%",
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Price", value=f"${price:.2f}", inline=True)
+    embed.add_field(name="Change", value=f"{change:.2f}", inline=True)
+    embed.set_footer(text="Powered by Yahoo Finance 📊")
+
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def why(ctx, symbol: str):
-    """Get recent news explaining stock movement."""
     news = get_stock_news(symbol.upper())
-    await ctx.send(f"📰 **Why is {symbol.upper()} moving?**\n" + "\n".join(news))
+    embed = discord.Embed(
+        title=f"📰 Why is {symbol.upper()} moving?",
+        color=0x7289da,
+        timestamp=datetime.now(timezone.utc)
+    )
+    for n in news:
+        embed.add_field(name="•", value=n, inline=False)
 
-@bot.event
-async def on_ready():
-    print(f"We are ready to go in, {bot.user.name}")
+    await ctx.send(embed=embed)
 
-@bot.event
-async def on_member_join(member):
-    await member.send(f"Welcome to the server {member.name}")
+# --- WATCHLIST COMMANDS ---
+@bot.command()
+async def addstock(ctx, symbol: str):
+    symbol = symbol.upper()
+    price, _, _ = get_stock_info(symbol)
 
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
+    if price is None:
+        await ctx.send(f"❌ Invalid ticker: `{symbol}`")
         return
-    if "shit" in message.content.lower():
-        await message.delete()
-        await message.channel.send(f"{message.author.mention} dont use that word! ")
 
+    if symbol in WATCHLIST:
+        await ctx.send(f"⚠️ `{symbol}` is already in the watchlist.")
+        return
 
+    WATCHLIST.append(symbol)
+    save_watchlist()
+    await ctx.send(f"✅ Added `{symbol}` to the watchlist!")
 
+@bot.command()
+async def removestock(ctx, symbol: str):
+    symbol = symbol.upper()
+    if symbol not in WATCHLIST:
+        await ctx.send(f"❌ `{symbol}` is not in the watchlist.")
+        return
 
-    await bot.process_commands(message)
+    WATCHLIST.remove(symbol)
+    save_watchlist()
+    await ctx.send(f"🗑 Removed `{symbol}` from the watchlist.")
 
+@bot.command()
+async def liststocks(ctx):
+    if not WATCHLIST:
+        await ctx.send("📭 No stocks are currently being tracked.")
+        return
+
+    embed = discord.Embed(
+        title="📈 Current Watchlist",
+        description="\n".join([f"• {s}" for s in WATCHLIST]),
+        color=0x3498db,
+        timestamp=datetime.now(timezone.utc)
+    )
+    await ctx.send(embed=embed)
+
+# --- FUN COMMANDS ---
 @bot.command()
 async def hello(ctx):
     await ctx.send(f"Hello {ctx.author.mention}!")
-
 
 @bot.command()
 async def assign(ctx):
@@ -205,7 +267,8 @@ async def assign(ctx):
         await ctx.author.add_roles(role)
         await ctx.send(f"{ctx.author.mention} is now assigned to {role}")
     else:
-        await ctx.send("you messed up gang")
+        await ctx.send("Role not found!")
+
 @bot.command()
 async def remove(ctx):
     role = discord.utils.get(ctx.guild.roles, name=s_role)
@@ -213,38 +276,37 @@ async def remove(ctx):
         await ctx.author.remove_roles(role)
         await ctx.send(f"{ctx.author.mention} had the {role} removed")
     else:
-        await ctx.send("you messed up gang")
+        await ctx.send("Role not found!")
 
 @bot.command()
 async def dm(ctx, *, msg):
-    await ctx.author.send(f"You said {msg}")
-
+    await ctx.author.send(f"You said: {msg}")
 
 @bot.command()
 async def reply(ctx):
     await ctx.reply("This is a reply to your message")
 
 @bot.command()
-async  def poll(ctx, *, question):
-    embed = discord.Embed(title="New Poll", description=question)
+async def poll(ctx, *, question):
+    embed = discord.Embed(title="📊 New Poll", description=question)
     poll_message = await ctx.send(embed=embed)
     await poll_message.add_reaction("👍")
     await poll_message.add_reaction("👎")
 
-
 @bot.command()
 @commands.has_role(s_role)
 async def secret(ctx):
-    await ctx.send("Welcome to the gay club!")
+    await ctx.send("Welcome to the secret club!")
 
 @secret.error
 async def secret_error(ctx, error):
     if isinstance(error, commands.MissingRole):
-        await ctx.send("you dont have permission to do that!")
+        await ctx.send("You don’t have permission to do that!")
 
+# --- EVENTS ---
 @bot.event
 async def on_ready():
-    print(f"We are ready to go in, {bot.user.name}")
+    print(f"✅ Logged in as {bot.user.name}")
     if not stock_alerts.is_running():
         stock_alerts.start()
     if not daily_summary.is_running():
@@ -252,9 +314,19 @@ async def on_ready():
     if not earnings_reminder.is_running():
         earnings_reminder.start()
 
+@bot.event
+async def on_member_join(member):
+    await member.send(f"Welcome to the server {member.name}!")
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if "shit" in message.content.lower():
+        await message.delete()
+        await message.channel.send(f"{message.author.mention} please don’t use that word!")
+    await bot.process_commands(message)
+
+# --- KEEP ALIVE + RUN ---
 webserver.keep_alive()
-
-
-
-bot.run(token, log_handler=handler, log_level= logging.DEBUG)
-
+bot.run(token, log_handler=handler, log_level=logging.DEBUG)
